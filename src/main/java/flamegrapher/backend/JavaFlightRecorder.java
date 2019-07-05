@@ -42,6 +42,7 @@ import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.logging.Logger;
 import io.vertx.core.logging.LoggerFactory;
+import io.vertx.ext.web.FileUpload;
 import io.vertx.ext.web.RoutingContext;
 
 public class JavaFlightRecorder implements Profiler {
@@ -62,12 +63,14 @@ public class JavaFlightRecorder implements Profiler {
     String recordingOption = "name";
     private final String dumpsBucket;
     private final String flamesBucket;
+    private final String dumpsPrefix;
+    private final String flamesPrefix;
 
     public JavaFlightRecorder(Vertx vertx, JsonObject config) {
         this.vertx = vertx;
         this.config = config;
         s3ClientOptions = new S3ClientOptions().setHostnameOverride(config.getString("FLAMEGRAPHER_S3_SERVER"))
-                                               .setAwsRegion("us-east-1")
+                                               .setAwsRegion(config.getString("FLAMEGRAPHER_S3_REGION", "us-east-1"))
                                                .setAwsServiceName("s3")
                                                .setConnectTimeout(30000)
                                                .setGlobalTimeoutMs(30000L)
@@ -78,6 +81,8 @@ public class JavaFlightRecorder implements Profiler {
         s3Client = new S3Client(vertx, s3ClientOptions);
         dumpsBucket = config.getString("FLAMEGRAPHER_S3_DUMPS_BUCKET", "dumps");
         flamesBucket = config.getString("FLAMEGRAPHER_S3_FLAMES_BUCKET", "flames");
+        dumpsPrefix = config.getString("FLAMEGRAPHER_S3_DUMPS_PREFIX", "");
+        flamesPrefix = config.getString("FLAMEGRAPHER_S3_FLAMES_PREFIX", "");
         try {
             Files.createDirectories(Paths.get(workingDir()));
         } catch (IOException e) {
@@ -246,6 +251,21 @@ public class JavaFlightRecorder implements Profiler {
     private String workingDir() {
         return config.getString("FLAMEGRAPHER_JFR_DUMP_PATH", "/tmp/flamegrapher/");
     }
+    
+    public void storeFileLocally(FileUpload fileUpload, Future<String> handler) {
+	vertx.fileSystem().move(fileUpload.uploadedFileName(), workingDir() + "uploaded-" + fileUpload.fileName(), asyncFile -> {
+	    if (asyncFile.succeeded()) {
+		handler.complete("uploaded-" + fileUpload.fileName());
+	    } else {
+		handler.fail(asyncFile.cause());
+	    }
+	    vertx.fileSystem().delete(fileUpload.uploadedFileName(), asyncDelete -> {
+		    if (!asyncFile.succeeded()) {
+			logger.error("Unable to delete ", fileUpload.uploadedFileName());
+		    };
+	    });
+	});
+    }
 
     @Override
     public void save(String pid, String recording, Future<JsonObject> handler) {
@@ -255,6 +275,7 @@ public class JavaFlightRecorder implements Profiler {
                  if (asyncFile.succeeded()) {
                      String key = Paths.get(filename)
                                        .getFileName()
+                                       .resolve(dumpsPrefix)
                                        .toString();
                      s3Client.adaptiveUpload(dumpsBucket, key,
                              new AdaptiveUploadRequest(asyncFile.result()).withContentType("application/jfr-dump"),
@@ -284,6 +305,7 @@ public class JavaFlightRecorder implements Profiler {
 
                 String key = eventType + "." + Paths.get(filename)
                                                     .getFileName()
+                                                    .resolve(flamesPrefix)
                                                     .toString();
                 s3Client.putObject(flamesBucket, key,
                         new PutObjectRequest(buf).withContentType(APPLICATION_JSON_CHARSET_UTF_8), response -> {
@@ -339,7 +361,7 @@ public class JavaFlightRecorder implements Profiler {
 
     @Override
     public void listSavedDumps(Future<JsonArray> handler) {
-        s3Client.getBucket(dumpsBucket, new GetBucketRequest(), response -> {
+        s3Client.getBucket(dumpsBucket, new GetBucketRequest().withPrefix(dumpsPrefix), response -> {
             JsonArray result = new JsonArray();
             response.getData()
                     .getContentsList()
@@ -356,7 +378,7 @@ public class JavaFlightRecorder implements Profiler {
 
     @Override
     public void listSavedFlames(Future<JsonArray> handler) {
-        s3Client.getBucket(flamesBucket, new GetBucketRequest(), response -> {
+        s3Client.getBucket(flamesBucket, new GetBucketRequest().withPrefix(flamesPrefix), response -> {
             JsonArray result = new JsonArray();
             response.getData()
                     .getContentsList()
